@@ -39,10 +39,12 @@ type KillSwitchCloseInputs struct {
 	OKXCloser       OKXLiveCloser
 	OKXFetcher      OKXPositionsFetcher
 
-	RHLiveCrypto  []StrategyConfig
-	RHLiveOptions []StrategyConfig
-	RHCloser      RobinhoodLiveCloser
-	RHFetcher     RobinhoodPositionsFetcher
+	RHLiveCrypto        []StrategyConfig
+	RHLiveOptions       []StrategyConfig
+	RHCloser            RobinhoodLiveCloser
+	RHFetcher           RobinhoodPositionsFetcher
+	RHResolveUnresolved func() map[string]error
+	RHFreshLongs        func() map[string]float64
 
 	TSLiveAll []StrategyConfig
 	TSCloser  TopStepLiveCloser
@@ -433,6 +435,14 @@ func planKillSwitchClose(in KillSwitchCloseInputs) KillSwitchClosePlan {
 			"[CRITICAL] rh-close: Robinhood live crypto strategies configured but RHFetcher unwired — cannot confirm flat (kill switch will retry next cycle)")
 		plan.OnChainConfirmedFlat = false
 	case len(in.RHLiveCrypto) > 0:
+		var rhUnresolved map[string]error
+		if in.RHResolveUnresolved != nil {
+			rhUnresolved = in.RHResolveUnresolved()
+		}
+		var rhFreshLongs map[string]float64
+		if in.RHFreshLongs != nil {
+			rhFreshLongs = in.RHFreshLongs()
+		}
 		rhPositions, err := in.RHFetcher()
 		if err != nil {
 			plan.LogLines = append(plan.LogLines,
@@ -440,7 +450,7 @@ func planKillSwitchClose(in KillSwitchCloseInputs) KillSwitchClosePlan {
 			plan.OnChainConfirmedFlat = false
 		} else {
 			ctx, cancel := context.WithTimeout(context.Background(), in.platformCloseBudget(in.RHCloseTimeout))
-			plan.RHCloseReport = forceCloseRobinhoodLive(ctx, rhPositions, in.RHLiveCrypto, in.RHCloser)
+			plan.RHCloseReport = forceCloseRobinhoodLive(ctx, rhPositions, in.RHLiveCrypto, in.RHCloser, in.RHFetcher, rhUnresolved, rhFreshLongs)
 			cancel()
 			if !plan.RHCloseReport.ConfirmedFlat() {
 				plan.OnChainConfirmedFlat = false

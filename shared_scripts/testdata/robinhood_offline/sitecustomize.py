@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import sys
+import time
 
 _MODE = os.environ.get("RH_OFFLINE_STUB_MODE", "")
 _MODES = (
@@ -19,6 +20,7 @@ _MODES = (
     "token_cache_dir_error",
     "transport_error_secret",
     "login_verification_required",
+    "routes",
 )
 _TOKEN_OK_MODES = ("login_ok", "token_cache_unwritable", "token_cache_dir_error")
 _CACHE_MODES = ("token_cache_unwritable", "token_cache_dir_error")
@@ -141,10 +143,81 @@ def _install():
             })
         return None
 
-    log_path = os.environ.get("RH_OFFLINE_STUB_LOG", "")
+    routes = {}
+    route_counts = {}
+    if _MODE == "routes":
+        with open(os.environ["RH_OFFLINE_STUB_ROUTES"]) as f:
+            routes = json.load(f)
+    route_log = os.environ.get("RH_OFFLINE_STUB_LOG", "")
+
+    def log_route_request(request, timeout, listed, with_body=True):
+        if not route_log:
+            return
+        body = request.body if with_body else None
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", "replace")
+        try:
+            parsed = json.loads(body) if body else None
+        except ValueError:
+            parsed = body
+        record = {
+            "method": request.method,
+            "url": request.url,
+            "timeout": list(timeout) if isinstance(timeout, tuple) else timeout,
+            "body": parsed,
+            "listed": listed,
+            "pid": os.getpid(),
+        }
+        with open(route_log, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def route_answer(request, timeout):
+        key = request.method + " " + request.url
+        items = routes.get(key)
+        if items is None and request.method == "POST" and "/oauth2/token/" in request.url:
+            log_route_request(request, timeout, True, with_body=False)
+            return response(request, 200, {
+                "access_token": _OFFLINE_TOKEN,
+                "token_type": "Bearer",
+                "refresh_token": "offline-refresh-token",
+                "expires_in": 86400,
+                "scope": "internal",
+            })
+        log_route_request(request, timeout, items is not None)
+        if items is None:
+            raise RuntimeError("robinhood offline stub: unlisted request " + key)
+        n = route_counts.get(key, 0)
+        route_counts[key] = n + 1
+        item = items[min(n, len(items) - 1)]
+        if item.get("sleep_s"):
+            time.sleep(float(item["sleep_s"]))
+        failure = item.get("raise")
+        if failure == "connect_timeout":
+            raise requests.exceptions.ConnectTimeout("robinhood offline stub: connect timeout for %s" % request.url)
+        if failure == "new_connection":
+            from urllib3.exceptions import NewConnectionError
+            raise requests.exceptions.ConnectionError(NewConnectionError(None, "robinhood offline stub: connection refused"))
+        if failure == "read_timeout":
+            raise requests.exceptions.ReadTimeout("robinhood offline stub: read timeout for %s" % request.url)
+        if failure == "connection":
+            raise requests.exceptions.ConnectionError("robinhood offline stub: connection reset for %s" % request.url)
+        resp = requests.models.Response()
+        resp.status_code = item.get("status", 200)
+        if "json" in item:
+            resp._content = json.dumps(item["json"]).encode()
+        else:
+            resp._content = item.get("text", "").encode()
+        resp.headers["Content-Type"] = "application/json"
+        for name, value in (item.get("headers") or {}).items():
+            resp.headers[name] = value
+        resp.url = request.url
+        resp.request = request
+        resp.reason = "robinhood offline stub"
+        resp.encoding = "utf-8"
+        return resp
 
     def log_request(request):
-        if not log_path:
+        if not route_log:
             return
         authorization = request.headers.get("Authorization")
         record = {
@@ -153,7 +226,7 @@ def _install():
             "auth": bool(authorization),
             "auth_is_offline_token": authorization == "Bearer " + _OFFLINE_TOKEN,
         }
-        with open(log_path, "a") as f:
+        with open(route_log, "a") as f:
             f.write(json.dumps(record) + "\n")
 
     def token_answer(request):
@@ -185,6 +258,8 @@ def _install():
         return response(request, 400, {"detail": "robinhood offline stub rejected the credentials"})
 
     def stub_send(self, request, *args, **kwargs):
+        if _MODE == "routes":
+            return route_answer(request, kwargs.get("timeout"))
         log_request(request)
         if _MODE == "transport_error":
             raise requests.exceptions.ConnectionError("robinhood offline stub: transport down for %s" % request.url)

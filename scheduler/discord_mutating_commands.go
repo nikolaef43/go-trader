@@ -903,6 +903,51 @@ func (d *DiscordNotifier) resolveEntryCommand(invokerID, guildID string, opts []
 	return resolveEntryAttemptByOperator(deps, invokerID, optionString(opts, "strategy", ""), optionString(opts, "attempt", "")).Message
 }
 
+func (d *DiscordNotifier) handleResolveRobinhoodOrder(s *discordgo.Session, i *discordgo.InteractionCreate, opts []*discordgo.ApplicationCommandInteractionDataOption) {
+	deferAck(s, i)
+	if release := optionString(opts, "release", ""); release != "" {
+		followupText(s, i, d.attestRobinhoodReleaseCommand(interactionUserID(i), i.GuildID, release, opts))
+		return
+	}
+	followupText(s, i, d.resolveRobinhoodOrderCommand(interactionUserID(i), i.GuildID, opts))
+}
+
+func (d *DiscordNotifier) attestRobinhoodReleaseCommand(invokerID, guildID, release string, opts []*discordgo.ApplicationCommandInteractionDataOption) string {
+	if ok, reason := authorizeCommand(robinhoodOperatorCommandName, invokerID, guildID, d.ownerID); !ok {
+		return reason
+	}
+	if release != robinhoodAttestReleaseChoice {
+		return fmt.Sprintf("refused: release %q is not %s", release, robinhoodAttestReleaseChoice)
+	}
+	if optionString(opts, "order", "") != "" {
+		return "refused: an attested release applies only to an attempt with no venue order id; run the command with the order id and no release option"
+	}
+	if d.ss == nil || d.ss.state == nil || d.ss.mu == nil || d.ss.stateDB == nil {
+		return "status server not ready"
+	}
+	deps := robinhoodEmergencyDeps{store: d.ss.stateDB, state: d.ss.state, mu: d.ss.mu}
+	strategyID, attemptID := optionString(opts, "strategy", ""), optionString(opts, "attempt", "")
+	checked, msg := prepareRobinhoodAttestedRelease(deps, d.ss.strategyConfig, strategyID, attemptID, time.Now())
+	if checked == nil {
+		return msg
+	}
+	if !d.confirmDestructive(invokerID, msg) {
+		return "Cancelled: no confirmation received. The attempt stays held."
+	}
+	return releaseRobinhoodAttemptByAttestation(deps, invokerID, strategyID, attemptID, *checked, time.Now())
+}
+
+func (d *DiscordNotifier) resolveRobinhoodOrderCommand(invokerID, guildID string, opts []*discordgo.ApplicationCommandInteractionDataOption) string {
+	if ok, reason := authorizeCommand(robinhoodOperatorCommandName, invokerID, guildID, d.ownerID); !ok {
+		return reason
+	}
+	if d.ss == nil || d.ss.state == nil || d.ss.mu == nil || d.ss.stateDB == nil {
+		return "status server not ready"
+	}
+	deps := robinhoodEmergencyDeps{store: d.ss.stateDB, state: d.ss.state, mu: d.ss.mu}
+	return resolveRobinhoodAttemptByOperator(deps, d.ss.strategyConfig, optionString(opts, "strategy", ""), optionString(opts, "attempt", ""), optionString(opts, "order", ""), time.Now())
+}
+
 func subcommandOptions(data discordgo.ApplicationCommandInteractionData) (string, []*discordgo.ApplicationCommandInteractionDataOption) {
 	for _, o := range data.Options {
 		if o.Type == discordgo.ApplicationCommandOptionSubCommand {
