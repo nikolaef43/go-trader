@@ -1,4 +1,5 @@
 
+import contextlib
 import os
 import sys
 import math
@@ -107,6 +108,14 @@ def _get_strike_interval(price: float) -> float:
     return 10
 
 
+@contextlib.contextmanager
+def robinhood_library():
+    with contextlib.redirect_stdout(sys.stderr):
+        import robin_stocks.robinhood as rh
+        rh.helper.set_output(sys.stderr)
+        yield rh
+
+
 class RobinhoodExchangeAdapter:
 
     def __init__(self, mode="paper"):
@@ -134,11 +143,11 @@ class RobinhoodExchangeAdapter:
                 )
             return
 
-        import robin_stocks.robinhood as rh
         import pyotp
 
         totp = pyotp.TOTP(totp_secret).now()
-        rh.login(username, password, mfa_code=totp)
+        with robinhood_library() as rh:
+            rh.login(username, password, mfa_code=totp)
         self._logged_in = True
 
     @property
@@ -160,15 +169,15 @@ class RobinhoodExchangeAdapter:
     def get_price(self, symbol: str) -> float:
         if self._logged_in:
             try:
-                import robin_stocks.robinhood as rh
-                if symbol.upper() in YAHOO_CRYPTO_MAP:
-                    quote = rh.crypto.get_crypto_quote(symbol)
-                    if quote and quote.get("mark_price"):
-                        return float(quote["mark_price"])
-                else:
-                    prices = rh.stocks.get_latest_price(symbol)
-                    if prices and prices[0]:
-                        return float(prices[0])
+                with robinhood_library() as rh:
+                    if symbol.upper() in YAHOO_CRYPTO_MAP:
+                        quote = rh.crypto.get_crypto_quote(symbol)
+                        if quote and quote.get("mark_price"):
+                            return float(quote["mark_price"])
+                    else:
+                        prices = rh.stocks.get_latest_price(symbol)
+                        if prices and prices[0]:
+                            return float(prices[0])
             except Exception as e:
                 print(f"[robinhood] robin_stocks price error for {symbol}: {e}", file=sys.stderr)
         return self._get_yahoo_price(symbol)
@@ -226,8 +235,8 @@ class RobinhoodExchangeAdapter:
     def get_real_expiry(self, underlying: str, target_dte: int) -> Tuple[str, int]:
         if self._logged_in:
             try:
-                import robin_stocks.robinhood as rh
-                chain = rh.options.get_chains(underlying)
+                with robinhood_library() as rh:
+                    chain = rh.options.get_chains(underlying)
                 if chain and chain.get("expiration_dates"):
                     today = datetime.now(timezone.utc).date()
                     target_date = today + timedelta(days=target_dte)
@@ -252,11 +261,11 @@ class RobinhoodExchangeAdapter:
                         option_type: str, target_strike: float) -> float:
         if self._logged_in:
             try:
-                import robin_stocks.robinhood as rh
-                options = rh.options.find_tradable_options(
-                    underlying, expirationDate=expiry,
-                    optionType=option_type
-                )
+                with robinhood_library() as rh:
+                    options = rh.options.find_tradable_options(
+                        underlying, expirationDate=expiry,
+                        optionType=option_type
+                    )
                 if options:
                     best_strike = None
                     best_diff = float('inf')
@@ -280,15 +289,16 @@ class RobinhoodExchangeAdapter:
                                 spot: float, vol: float) -> Tuple[float, float, dict]:
         if self._logged_in:
             try:
-                import robin_stocks.robinhood as rh
-                options = rh.options.find_tradable_options(
-                    underlying, expirationDate=expiry,
-                    strikePrice=str(strike), optionType=option_type
-                )
+                with robinhood_library() as rh:
+                    options = rh.options.find_tradable_options(
+                        underlying, expirationDate=expiry,
+                        strikePrice=str(strike), optionType=option_type
+                    )
                 if options:
                     opt_id = options[0].get("id") or options[0].get("url", "").split("/")[-2]
                     if opt_id:
-                        market_data = rh.options.get_option_market_data_by_id(opt_id)
+                        with robinhood_library() as rh:
+                            market_data = rh.options.get_option_market_data_by_id(opt_id)
                         if market_data and isinstance(market_data, list) and market_data[0]:
                             md = market_data[0]
                             mark = float(md.get("adjusted_mark_price", 0) or 0)
@@ -367,15 +377,15 @@ class RobinhoodExchangeAdapter:
     def market_buy(self, symbol: str, amount_usd: float) -> dict:
         if not self.is_live:
             raise RuntimeError("market_buy requires live mode")
-        import robin_stocks.robinhood as rh
-        result = rh.orders.order_buy_crypto_by_price(symbol, amount_usd)
+        with robinhood_library() as rh:
+            result = rh.orders.order_buy_crypto_by_price(symbol, amount_usd)
         return result or {}
 
     def market_sell(self, symbol: str, quantity: float) -> dict:
         if not self.is_live:
             raise RuntimeError("market_sell requires live mode")
-        import robin_stocks.robinhood as rh
-        result = rh.orders.order_sell_crypto_by_quantity(symbol, quantity)
+        with robinhood_library() as rh:
+            result = rh.orders.order_sell_crypto_by_quantity(symbol, quantity)
         return result or {}
 
     def get_crypto_positions_strict(self) -> list:
@@ -392,17 +402,18 @@ class RobinhoodExchangeAdapter:
                 "Robinhood adapter not logged in — cannot fetch crypto positions"
             )
         import requests
-        import robin_stocks.robinhood.helper as rh_helper
-        import robin_stocks.robinhood.urls as rh_urls
 
-        if rh_helper.LOGGED_IN is not True:
+        with robinhood_library() as rh:
+            logged_in = rh.helper.LOGGED_IN
+            session = rh.helper.SESSION
+            first_url = rh.urls.crypto_holdings_url()
+
+        if logged_in is not True:
             raise _HoldingsReadError("robin_stocks session not logged in")
-        session = rh_helper.SESSION
         authorization = session.headers.get("Authorization")
         if not isinstance(authorization, str) or not authorization.strip():
             raise _HoldingsReadError("robin_stocks session has no Authorization header")
 
-        first_url = rh_urls.crypto_holdings_url()
         holdings_host = urlsplit(first_url).netloc
         deadline = time.monotonic() + _HOLDINGS_TOTAL_DEADLINE_S
         requested = set()
