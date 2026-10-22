@@ -6,13 +6,14 @@ import os
 import re
 from typing import Dict, List, Optional
 
+from observation_kinds import v3_kinds_problem, v3_other_kind_records
+
 RUN_SCHEMA_V2 = "go_trader_observation_run/v2"
 SEGMENT_SCHEMA_V2 = "go_trader_observation_segment/v2"
 RECORDING_SCHEMA_V2 = "go_trader_observation_recording/v2"
 RUN_SCHEMA_V3 = "go_trader_observation_run/v3"
 SEGMENT_SCHEMA_V3 = "go_trader_observation_segment/v3"
 RECORDING_SCHEMA_V3 = "go_trader_observation_recording/v3"
-BOOK_RECORD_KINDS = ("book", "book_sub", "book_marker", "book_need", "book_release")
 SERIES_SCHEMA = "go_trader_trade_flow_series/v1"
 KIND = "trade_flow"
 
@@ -477,6 +478,9 @@ def load_trade_recording(run_dir: str, attach=None) -> dict:
     v3 = run.get("schema") == RUN_SCHEMA_V3
     segment_schema = SEGMENT_SCHEMA_V3 if v3 else SEGMENT_SCHEMA_V2
     recording_schema = RECORDING_SCHEMA_V3 if v3 else RECORDING_SCHEMA_V2
+    if v3 and v3_kinds_problem(run):
+        raise TradeRecordingError(f"run manifest {v3_kinds_problem(run)}")
+    other_kinds = v3_other_kind_records(run.get("kinds") or []) if v3 else frozenset()
     if KIND not in (run.get("kinds") or []):
         raise TradeRecordingError("the run did not record trade_flow")
     if run.get("trade_contract") != CONTRACT:
@@ -527,6 +531,8 @@ def load_trade_recording(run_dir: str, attach=None) -> dict:
                 or header.get("run_id") != run.get("run_id") or header.get("trade_contract") != CONTRACT
                 or header.get("coins") != coins):
             raise TradeRecordingError(f"segment {seg['file']} header does not match the run")
+        if v3 and (v3_kinds_problem(header) or header.get("kinds") != run.get("kinds")):
+            raise TradeRecordingError(f"segment {seg['file']} header {v3_kinds_problem(header) or 'lists different kinds than the run'}")
         if end.get("k") != "end" or end.get("records") != len(lines) - 2:
             raise TradeRecordingError(f"segment {seg['file']} end record is missing or miscounts its records")
         if not seg.get("complete"):
@@ -577,7 +583,7 @@ def load_trade_recording(run_dir: str, attach=None) -> dict:
             elif kind in ("interval", "invalidate", "cover"):
                 go_events.append(_canon_event(rec))
                 continue
-            elif kind == "obs" or (v3 and kind in BOOK_RECORD_KINDS):
+            elif kind == "obs" or kind in other_kinds:
                 continue
             else:
                 raise TradeRecordingError(f"{seg['file']}:{line_no} has unknown record kind {kind!r}")

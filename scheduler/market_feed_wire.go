@@ -23,6 +23,7 @@ const (
 	feedSealVersionMacro      = 5
 	feedSealVersionProfile    = 6
 	feedSealVersionBooks      = 7
+	feedSealVersionPremium    = 8
 	feedWireMaxRequestBytes   = 4 << 10
 	feedWireMaxHeaderBytes    = 1 << 20
 	feedSealMaxBytes          = 64 << 20
@@ -249,7 +250,8 @@ type feedSealDoc struct {
 
 	VolumeProfiles []feedSealVolumeProfile `json:"volume_profiles,omitempty"`
 
-	L2Books []feedSealL2Book `json:"l2_books,omitempty"`
+	L2Books  []feedSealL2Book  `json:"l2_books,omitempty"`
+	Premiums []feedSealPremium `json:"perp_premiums,omitempty"`
 }
 
 type feedSealTradeInterval struct {
@@ -309,7 +311,10 @@ type feedSealTradeFlow struct {
 	Gaps           []feedSealObservationGap `json:"gaps"`
 }
 
-func feedSealVersionFor(hasObservations, hasAccounting, hasTrades, hasMacro, hasProfiles, hasBooks bool) int {
+func feedSealVersionFor(hasObservations, hasAccounting, hasTrades, hasMacro, hasProfiles, hasBooks, hasPremium bool) int {
+	if hasPremium {
+		return feedSealVersionPremium
+	}
 	if hasBooks {
 		return feedSealVersionBooks
 	}
@@ -332,7 +337,7 @@ func feedSealVersionFor(hasObservations, hasAccounting, hasTrades, hasMacro, has
 }
 
 func feedSealVersionSupported(v int) bool {
-	return v == feedSealVersionBase || v == feedSealVersion || v == feedSealVersionAccounting || v == feedSealVersionTrades || v == feedSealVersionMacro || v == feedSealVersionProfile || v == feedSealVersionBooks
+	return v == feedSealVersionBase || v == feedSealVersion || v == feedSealVersionAccounting || v == feedSealVersionTrades || v == feedSealVersionMacro || v == feedSealVersionProfile || v == feedSealVersionBooks || v == feedSealVersionPremium
 }
 
 func (doc *feedSealDoc) hasMacro() bool {
@@ -492,7 +497,8 @@ func feedSealDocFromSnapshot(snap *marketSnapshot, key int64, source, instance s
 	doc.MacroCalendars, doc.MacroQuotes = sealMacro(snap.macro)
 	doc.VolumeProfiles = sealVolumeProfiles(snap.profiles)
 	doc.L2Books = sealL2Books(snap.books)
-	doc.V = feedSealVersionFor(len(doc.Observations) > 0, len(doc.AccountingFunding) > 0, len(doc.TradeFlows) > 0, doc.hasMacro(), len(doc.VolumeProfiles) > 0, len(doc.L2Books) > 0)
+	doc.Premiums = sealPremiums(snap.premiums)
+	doc.V = feedSealVersionFor(len(doc.Observations) > 0, len(doc.AccountingFunding) > 0, len(doc.TradeFlows) > 0, doc.hasMacro(), len(doc.VolumeProfiles) > 0, len(doc.L2Books) > 0, len(doc.Premiums) > 0)
 	return doc, nil
 }
 
@@ -696,10 +702,10 @@ func decodeFeedSeal(blob []byte, wantKey int64) (*feedSealDoc, error) {
 		return nil, errors.New("seal bytes are not in canonical form")
 	}
 	if !feedSealVersionSupported(doc.V) {
-		return nil, fmt.Errorf("seal version %d, want %d through %d", doc.V, feedSealVersionBase, feedSealVersionBooks)
+		return nil, fmt.Errorf("seal version %d, want %d through %d", doc.V, feedSealVersionBase, feedSealVersionPremium)
 	}
-	if want := feedSealVersionFor(len(doc.Observations) > 0, len(doc.AccountingFunding) > 0, len(doc.TradeFlows) > 0, doc.hasMacro(), len(doc.VolumeProfiles) > 0, len(doc.L2Books) > 0); doc.V != want {
-		return nil, fmt.Errorf("seal version %d carries %d observations, %d accounting funding entries, %d trade flows, %d macro inputs, %d volume profiles and %d l2 books; that content seals as version %d", doc.V, len(doc.Observations), len(doc.AccountingFunding), len(doc.TradeFlows), len(doc.MacroCalendars)+len(doc.MacroQuotes), len(doc.VolumeProfiles), len(doc.L2Books), want)
+	if want := feedSealVersionFor(len(doc.Observations) > 0, len(doc.AccountingFunding) > 0, len(doc.TradeFlows) > 0, doc.hasMacro(), len(doc.VolumeProfiles) > 0, len(doc.L2Books) > 0, len(doc.Premiums) > 0); doc.V != want {
+		return nil, fmt.Errorf("seal version %d carries %d observations, %d accounting funding entries, %d trade flows, %d macro inputs, %d volume profiles, %d l2 books and %d premium records; that content seals as version %d", doc.V, len(doc.Observations), len(doc.AccountingFunding), len(doc.TradeFlows), len(doc.MacroCalendars)+len(doc.MacroQuotes), len(doc.VolumeProfiles), len(doc.L2Books), len(doc.Premiums), want)
 	}
 	if doc.Key != wantKey {
 		return nil, fmt.Errorf("seal key %d, requested %d", doc.Key, wantKey)
@@ -770,6 +776,9 @@ func validateFeedSealDoc(doc *feedSealDoc) error {
 		return err
 	}
 	if err := validateFeedSealL2Books(doc.L2Books, doc.Key*1000); err != nil {
+		return err
+	}
+	if err := validateFeedSealPremiums(doc.Premiums); err != nil {
 		return err
 	}
 	return validateFeedSealAccountingFunding(doc.AccountingFunding)
@@ -899,6 +908,7 @@ func (doc *feedSealDoc) snapshot() *marketSnapshot {
 	snap.macro = snapshotMacro(doc.MacroCalendars, doc.MacroQuotes)
 	snap.profiles = snapshotVolumeProfiles(doc.VolumeProfiles)
 	snap.books = snapshotL2Books(doc.L2Books)
+	snap.premiums = snapshotPremiums(doc.Premiums)
 	for _, f := range doc.Funding {
 		snap.funding[f.Coin] = feedFunding{
 			Current:    f.Current,

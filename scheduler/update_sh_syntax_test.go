@@ -68,6 +68,10 @@ var shellSuiteWirings = map[string]shellSuiteWiring{
 		ciStep: true,
 		marker: "PASS: l2_book replay harness (sealed book payloads match the independent recording replay; mixed v3 runs keep every importer; tampered, truncated, unclosed, dropped, mislabeled and contradicted recordings refused)",
 	},
+	"test_premium_replay.sh": {
+		ciStep: true,
+		marker: "PASS: premium replay harness (sealed quote/oracle payloads and decisions match the independent recording replay; premium-only, book-only and mixed v3 runs import by their typed contracts and kind/contract mismatches are refused; tampered, truncated and contradicted recordings refused)",
+	},
 	"test_ledger_export.sh": {
 		ciStep:     true,
 		marker:     "PASS: ledger capture and export (active-WAL capture without source effects, version 2 export contract, every refusal leaves inputs unchanged)",

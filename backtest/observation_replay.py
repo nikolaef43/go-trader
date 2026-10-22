@@ -9,6 +9,8 @@ import os
 import sys
 from typing import Dict, List, Optional
 
+from observation_kinds import v3_kinds_problem, v3_other_kind_records
+
 RUN_SCHEMA = "go_trader_observation_run/v1"
 RUN_SCHEMA_V2 = "go_trader_observation_run/v2"
 SEGMENT_SCHEMA_V2 = "go_trader_observation_segment/v2"
@@ -26,7 +28,6 @@ OBSERVATION_KIND = "open_interest"
 
 
 TRADE_RECORD_KINDS = ("trades", "sub", "cover", "interval", "invalidate", "tick")
-BOOK_RECORD_KINDS = ("book", "book_sub", "book_marker", "book_need", "book_release")
 
 
 class RecordingError(ValueError):
@@ -97,6 +98,9 @@ def load_recording(run_dir: str) -> dict:
         run = json.load(fh)
     v3 = run.get("schema") == RUN_SCHEMA_V3
     v2 = run.get("schema") == RUN_SCHEMA_V2 or v3
+    if v3 and v3_kinds_problem(run):
+        raise RecordingError(f"run manifest {v3_kinds_problem(run)}")
+    other_kinds = v3_other_kind_records(run.get("kinds") or []) if v3 else frozenset()
     if v2:
         if OBSERVATION_KIND not in (run.get("kinds") or []):
             raise RecordingError(f"run manifest schema {run.get('schema')!r} did not record {OBSERVATION_KIND}; "
@@ -145,6 +149,8 @@ def load_recording(run_dir: str) -> dict:
         end = json.loads(lines[-1])
         if header.get("k") != "header" or header.get("schema") != recording_schema or header.get("run_id") != run.get("run_id"):
             raise RecordingError(f"segment {seg['file']} header does not match the run")
+        if v3 and (v3_kinds_problem(header) or header.get("kinds") != run.get("kinds")):
+            raise RecordingError(f"segment {seg['file']} header {v3_kinds_problem(header) or 'lists different kinds than the run'}")
         if v2:
             header = {**header, **(header.get("open_interest_contract") or {})}
         if header.get("cadence_ms") != cadence or header.get("units") != ACCEPTED_UNITS or header.get("source") != ACCEPTED_SOURCE:
@@ -171,7 +177,7 @@ def load_recording(run_dir: str) -> dict:
                 continue
             if v2 and kind in TRADE_RECORD_KINDS:
                 continue
-            if v3 and kind in BOOK_RECORD_KINDS:
+            if kind in other_kinds:
                 continue
             if kind == "drop":
                 report["dropped"] += int(rec.get("count") or 0)
@@ -706,8 +712,100 @@ def _cmd_harness_profiles(args) -> int:
     return 1 if failures else 0
 
 
+PREMIUM_DECISION_COLUMNS = ["timestamp", "ppr_reason", "ppr_premium", "ppr_mean", "ppr_std", "ppr_z_extreme",
+                            "ppr_window_sha256", "ppr_deadline_ms", "ppr_carried", "signal"]
+
+
+def _cmd_import_premium(args) -> int:
+    from premium_replay import load_premium_recording, write_premium_series
+    loaded = load_premium_recording(args.run_dir)
+    report = loaded["report"]
+    out = {k: report[k] for k in ("run_id", "recorder_version", "quote_frames", "context_frames", "malformed_frames",
+                                  "dropped", "events_compared", "economic_evidence", "refusals", "connections",
+                                  "max_quote_silence_ms", "max_context_silence_ms")}
+    out["sessions"] = report["sessions"]
+    out["segments"] = report["segments"]
+    out["series"] = {}
+    for coin, series in loaded["series"].items():
+        entry = {"samples": len(series["samples"]), "stats": series["stats"], "quote_latency_ms": series["quote_latency_ms"],
+                 "samples_sha256": series["samples_sha256"]}
+        if args.out_dir:
+            path = os.path.join(args.out_dir, f"{coin}_perp_premium.json.gz")
+            entry["file"] = path
+            entry["file_sha256"] = write_premium_series(series, path)
+        out["series"][coin] = entry
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+def _premium_decisions(df, obs: dict, params: dict) -> list:
+    _here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(_here, "..", "shared_strategies", "open", "futures"))
+    import strategies as futures_registry
+    out = futures_registry.apply_strategy("perpetual_premium_reversion", df, {**params, "premium_observations": obs})
+    return json.loads(out[PREMIUM_DECISION_COLUMNS].to_json(orient="values", double_precision=15))
+
+
+def _premium_harness_case(directory: str, harness: dict, case: dict, loaded: dict) -> dict:
+    import pandas as pd
+    _here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(_here, "..", "shared_tools"))
+    from market_payload import MARKET_PAYLOAD_VERSION, market_frame_rows, market_premium, validate_market_payload
+    from premium_replay import payload_from_series
+    with open(os.path.join(directory, case["payload"])) as fh:
+        payload = json.load(fh)
+    validate_market_payload(payload)
+    coin = case["coin"]
+    rows = market_frame_rows(payload, coin, harness["timeframe"])
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df.index = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    live = market_premium(payload, coin)
+    params = harness.get("params") or {}
+    replay = payload_from_series(loaded["series"][coin], live["bar_interval_ms"], live["cutoff_ms"], live["window_ms"])
+    live_a = _premium_decisions(df, live, params)
+    live_b = _premium_decisions(df, market_premium(payload, coin), params)
+    replayed = _premium_decisions(df, replay, params)
+    row = next((r for r in live_a if r[7] is not None and int(r[7]) == int(case["decision_ms"]) and not r[8]), None)
+    checks = {
+        "payload_version_premium": payload.get("version") == MARKET_PAYLOAD_VERSION,
+        "payload_premium_available": bool(live.get("available")),
+        "oracle_event_time_absent": all((s.get("context") or {}).get("oracle_event_ms") is None for s in live["samples"]),
+        "repeat_evaluation_identical": live_a == live_b,
+        "recording_samples_match_seal": live["samples"] == replay["samples"],
+        "recording_decisions_match_seal": live_a == replayed,
+        "decision_row_present": row is not None,
+        "decision_signal": row is not None and int(row[-1]) == int(case["signal"]),
+        "decision_reason": row is not None and ("reason" not in case or row[1] == case["reason"]),
+    }
+    failures = [f"{k}: false" for k, v in checks.items() if not v]
+    reasons = {}
+    for r in live_a:
+        reasons[r[1]] = reasons.get(r[1], 0) + 1
+    return {"payload": case["payload"], "coin": coin, "cutoff_ms": live.get("cutoff_ms"), "samples": len(live["samples"]),
+            "decision": row, "checks": checks, "reasons": reasons, "failures": failures}
+
+
+def _cmd_harness_premium(args) -> int:
+    from premium_replay import load_premium_recording
+    with open(os.path.join(args.dir, "harness.json")) as fh:
+        harness = json.load(fh)
+    loaded = load_premium_recording(os.path.join(args.dir, "recording"))
+    results = [_premium_harness_case(args.dir, harness, case, loaded) for case in harness["cases"]]
+    failures = [f"{r['payload']}: {f}" for r in results for f in r["failures"]]
+    for coin, want in (harness.get("expected_rejected") or {}).items():
+        got = loaded["series"][coin]["stats"]["rejected"]
+        if got != want:
+            failures.append(f"{coin} rejected premium records {got}, want {want}")
+    if not loaded["report"]["economic_evidence"]:
+        failures.append(f"the harness recording is refused as evidence: {loaded['report']['refusals']}")
+    print(json.dumps({"recording": {k: loaded["report"][k] for k in ("quote_frames", "context_frames", "events_compared",
+                                                                     "sessions", "economic_evidence", "malformed_frames")},
+                      "cases": results, "failures": failures}, indent=2, sort_keys=True, default=str))
+    return 1 if failures else 0
+
+
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Verify and import go-trader observation recordings (#1635, #1637, #1638, #1665)")
+    p = argparse.ArgumentParser(description="Verify and import go-trader observation recordings (#1635, #1637, #1638, #1639, #1665)")
     sub = p.add_subparsers(dest="cmd", required=True)
     imp = sub.add_parser("import", help="Verify a closed recording run and print (or write) its rebuilt series")
     imp.add_argument("--run-dir", required=True)
@@ -729,10 +827,20 @@ def main(argv=None) -> int:
     imb.add_argument("--out-dir", default="")
     hab = sub.add_parser("harness-books", help="Compare sealed l2_book payloads with the independent recording replay")
     hab.add_argument("--dir", required=True)
+    imp3 = sub.add_parser("import-premium", help="Replay a closed quote/oracle premium recording independently and print (or write) its series")
+    imp3.add_argument("--run-dir", required=True)
+    imp3.add_argument("--out-dir", default="")
+    hpr = sub.add_parser("harness-premium", help="Compare sealed premium payloads and decisions with the recording replay")
+    hpr.add_argument("--dir", required=True)
     args = p.parse_args(argv)
     from trade_flow_replay import TradeRecordingError
     from book_replay import BookRecordingError
+    from premium_replay import PremiumRecordingError
     try:
+        if args.cmd == "import-premium":
+            return _cmd_import_premium(args)
+        if args.cmd == "harness-premium":
+            return _cmd_harness_premium(args)
         if args.cmd == "import":
             return _cmd_import(args)
         if args.cmd == "import-trades":
@@ -748,7 +856,7 @@ def main(argv=None) -> int:
         if args.cmd == "harness-books":
             return _cmd_harness_books(args)
         return _cmd_harness(args)
-    except (RecordingError, TradeRecordingError, BookRecordingError) as exc:
+    except (RecordingError, TradeRecordingError, BookRecordingError, PremiumRecordingError) as exc:
         print(f"recording error: {exc}", file=sys.stderr)
         return 1
 

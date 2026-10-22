@@ -496,6 +496,7 @@ type marketFeedOwner struct {
 	bookInstance string
 	bookTick     time.Duration
 	socketPing   time.Duration
+	premiums     map[feedObservationKey]*feedPremiumState
 	obsSession   uint64
 
 	accountingCoins   map[string]bool
@@ -553,6 +554,7 @@ func newMarketFeedOwner(clock func() time.Time, logf func(string, ...any)) *mark
 		bookInstance: boundedBookInstance(newFeedInstanceID(clock().UTC())),
 		bookTick:     feedBookTickEvery,
 		socketPing:   feedSocketPingEvery,
+		premiums:     make(map[feedObservationKey]*feedPremiumState),
 
 		accountingCoins:   make(map[string]bool),
 		accountingFunding: make(map[string]*feedAccountingFunding),
@@ -905,6 +907,7 @@ func (o *marketFeedOwner) Health(lastSnapshotID string) marketFeedHealth {
 	obsReadiness := o.ObservationReadiness()
 	tradeReadiness := o.TradeFlowReadiness()
 	profileReadiness := o.VolumeProfileReadiness()
+	premReady := o.PremiumReadiness()
 	o.feedMu.Lock()
 	now := o.now()
 	health := marketFeedHealth{
@@ -976,6 +979,15 @@ func (o *marketFeedOwner) Health(lastSnapshotID string) marketFeedHealth {
 			CoveredMs: r.CoveredMs, WindowMs: r.WindowMs, LastRecvMs: r.LastRecvMs,
 			Received: r.Stats.Frames, Rejected: r.Stats.Rejected, LastReject: r.Stats.LastReject, Detail: r.Detail,
 			Duplicates: r.Stats.Duplicates, Conflicts: r.Stats.Conflicts, Late: r.Stats.OutOfOrder,
+		})
+	}
+	for _, r := range premReady {
+		health.Observations = append(health.Observations, marketFeedHealthObs{
+			Key: r.Key.PayloadID(), Status: r.Status, Ready: r.Ready, Samples: r.Samples,
+			CoveredMs: r.CoveredMs, WindowMs: r.WindowMs, LastRecvMs: r.LastRecvMs, OpenGap: r.OpenGap,
+			Received: r.Stats.QuoteFrames + r.Stats.CtxFrames, Rejected: r.Stats.Rejected,
+			LastReject: r.Stats.LastReject, Detail: r.Detail,
+			Duplicates: r.Stats.QuoteDuplicates, Conflicts: r.Stats.QuoteConflicts, Invalid: r.Stats.Invalid,
 		})
 	}
 	sort.SliceStable(health.Observations, func(i, j int) bool { return health.Observations[i].Key < health.Observations[j].Key })

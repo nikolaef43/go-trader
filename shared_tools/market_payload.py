@@ -1,4 +1,4 @@
-MARKET_PAYLOAD_VERSION = 3
+MARKET_PAYLOAD_VERSION = 4
 
 
 class MarketPayloadError(Exception):
@@ -246,4 +246,22 @@ def market_macro_quotes(market, coin: str, quote_sha256: str, error_cls=None) ->
         return {"kind": "macro_quotes", "available": False, "coin": coin, "quote_sha256": quote_sha256,
                 "reason": f"market payload macro_quotes entry {key} is labelled "
                           f"{entry.get('kind')!r}/{entry.get('coin')!r}/{entry.get('quote_sha256')!r}"}
+    return dict(entry)
+
+
+def market_premium(market, coin: str, error_cls=None) -> dict:
+    payload = validate_market_payload(market, error_cls)
+    key = f"{coin}|perp_premium"
+    section = payload.get("perp_premiums")
+    if not isinstance(section, dict) or key not in section:
+        return {"available": False, "kind": "perp_premium", "coin": coin,
+                "reason": f"market payload carries no {key} records"}
+    entry = section[key]
+    if not isinstance(entry, dict):
+        return {"available": False, "kind": "perp_premium", "coin": coin,
+                "reason": f"market payload {key} records are not an object"}
+    if entry.get("kind") != "perp_premium" or entry.get("coin") != coin:
+        return {"available": False, "kind": "perp_premium", "coin": coin,
+                "reason": f"market payload {key} records are labelled "
+                          f"{entry.get('coin')!r}|{entry.get('kind')!r}"}
     return dict(entry)

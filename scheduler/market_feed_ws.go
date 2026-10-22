@@ -128,6 +128,7 @@ func (o *marketFeedOwner) runOneSocketSession(ctx context.Context) error {
 	obsSubscribed := make(map[string]bool)
 	tradesSubscribed := make(map[string]bool)
 	booksSubscribed := make(map[string]uint64)
+	bboSubscribed := make(map[string]bool)
 	midsSubscribed := false
 	syncSubscriptions := func() error {
 		keys, coins, _ := o.Subscriptions()
@@ -156,7 +157,11 @@ func (o *marketFeedOwner) runOneSocketSession(ctx context.Context) error {
 			}
 			subscribed[key] = true
 		}
-		for _, coin := range o.ObservationCoins() {
+		ctxCoins := o.ObservationCoins()
+		premiumCoins := o.PremiumCoins()
+		ctxCoins = append(ctxCoins, premiumCoins...)
+		sort.Strings(ctxCoins)
+		for _, coin := range ctxCoins {
 			if obsSubscribed[coin] {
 				continue
 			}
@@ -231,6 +236,21 @@ func (o *marketFeedOwner) runOneSocketSession(ctx context.Context) error {
 			}
 			delete(booksSubscribed, coin)
 		}
+		for _, coin := range premiumCoins {
+			if bboSubscribed[coin] {
+				continue
+			}
+			if err := writeJSON(map[string]any{
+				"method": "subscribe",
+				"subscription": map[string]any{
+					"type": "bbo",
+					"coin": coin,
+				},
+			}); err != nil {
+				return err
+			}
+			bboSubscribed[coin] = true
+		}
 		return nil
 	}
 
@@ -302,6 +322,7 @@ func (o *marketFeedOwner) handleSocketMessage(payload []byte) {
 		recvAt := o.now()
 		o.IngestTradesFrame(nil, recvAt, payload)
 		o.IngestMalformedBookEnvelope(recvAt, payload)
+		o.IngestPremiumUnparsable(payload)
 		return
 	}
 	switch env.Channel {
@@ -339,9 +360,12 @@ func (o *marketFeedOwner) handleSocketMessage(payload []byte) {
 		coin, value, err := parseFeedOpenInterest(env.Data)
 		if coin == "" {
 			o.logf("[feed] dropped an activeAssetCtx message with no coin: %v", err)
-			return
+		} else {
+			o.IngestOpenInterest(coin, value, recvAt, payload, err)
 		}
-		o.IngestOpenInterest(coin, value, recvAt, payload, err)
+		o.IngestPremiumContext(env.Data, payload)
+	case "bbo":
+		o.IngestPremiumQuote(env.Data, payload)
 	case "trades":
 		o.IngestTradesFrame(env.Data, o.now(), payload)
 	case "l2Book":

@@ -5,6 +5,8 @@ import os
 from fractions import Fraction
 from typing import Dict, List, Optional
 
+from observation_kinds import v3_kinds_problem
+
 RUN_SCHEMA_V3 = "go_trader_observation_run/v3"
 SEGMENT_SCHEMA_V3 = "go_trader_observation_segment/v3"
 RECORDING_SCHEMA_V3 = "go_trader_observation_recording/v3"
@@ -691,6 +693,8 @@ def load_book_recording(run_dir: str) -> dict:
         run = json.load(fh)
     if run.get("schema") != RUN_SCHEMA_V3:
         raise BookRecordingError(f"run manifest schema must be {RUN_SCHEMA_V3!r}, got {run.get('schema')!r}")
+    if v3_kinds_problem(run):
+        raise BookRecordingError(f"run manifest {v3_kinds_problem(run)}")
     if KIND not in (run.get("kinds") or []):
         raise BookRecordingError("the run did not record l2_book")
     if run.get("book_contract") != CONTRACT:
@@ -751,6 +755,8 @@ def load_book_recording(run_dir: str) -> dict:
         if len(lines) < 2:
             raise BookRecordingError(f"segment {seg['file']} has no header and end record")
         header, end = json.loads(lines[0]), json.loads(lines[-1])
+        if v3_kinds_problem(header) or header.get("kinds") != run.get("kinds"):
+            raise BookRecordingError(f"segment {seg['file']} header {v3_kinds_problem(header) or 'lists different kinds than the run'}")
         if (header.get("k") != "header" or header.get("schema") != RECORDING_SCHEMA_V3 or header.get("run_id") != run.get("run_id")
                 or header.get("book_contract") != CONTRACT or header.get("coins") != coins
                 or (header.get("sources") or {}).get(KIND) != CONTRACT["source"]):

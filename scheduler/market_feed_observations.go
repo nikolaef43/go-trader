@@ -392,6 +392,7 @@ func (o *marketFeedOwner) markObservationsDisconnectedLocked(atMs int64) {
 	}
 	o.markTradeFlowsDisconnectedLocked(atMs)
 	o.markBooksDisconnectedLocked(atMs)
+	o.markPremiumsDisconnectedLocked(atMs)
 }
 
 func (o *marketFeedOwner) ObservationCoins() []string {
@@ -425,6 +426,14 @@ func (o *marketFeedOwner) ObservationReadiness() []feedObservationReadiness {
 
 func (o *marketFeedOwner) applyObservationNeedsLocked(needs map[feedObservationKey]int64) {
 	for key, window := range needs {
+		if key.Kind == feedObservationPerpPremium {
+			if st := o.premiums[key]; st != nil {
+				st.raiseWindow(window)
+				continue
+			}
+			o.premiums[key] = newFeedPremiumState(key, window)
+			continue
+		}
 		if key.Kind == feedObservationTradeFlow {
 			o.applyTradeFlowNeedLocked(key, window)
 		}
@@ -435,7 +444,7 @@ func (o *marketFeedOwner) applyObservationNeedsLocked(needs map[feedObservationK
 		}
 	}
 	for key, window := range needs {
-		if key.Kind == feedObservationTradeFlow || key.Kind == feedObservationVolumeProfile {
+		if key.Kind == feedObservationTradeFlow || key.Kind == feedObservationVolumeProfile || key.Kind == feedObservationPerpPremium {
 			continue
 		}
 		if st := o.observations[key]; st != nil {
@@ -453,6 +462,11 @@ func (o *marketFeedOwner) dropUnneededObservationsLocked(needs map[feedObservati
 		}
 	}
 	o.dropUnneededTradeStatesLocked(needs)
+	for key := range o.premiums {
+		if _, ok := needs[key]; !ok {
+			delete(o.premiums, key)
+		}
+	}
 }
 
 type marketSnapshotObservation struct {
@@ -613,9 +627,10 @@ func attachObservationPayloads(payload *marketPayload, s *marketSnapshot, needs 
 	}
 	attachTradeFlowPayloads(payload, s, needs, barIntervalMs)
 	attachVolumeProfilePayloads(payload, s, needs, barIntervalMs)
+	attachPremiumPayloads(payload, s, needs, barIntervalMs)
 	keys := make([]feedObservationKey, 0, len(needs))
 	for k := range needs {
-		if k.Kind == feedObservationTradeFlow || k.Kind == feedObservationVolumeProfile {
+		if k.Kind == feedObservationTradeFlow || k.Kind == feedObservationVolumeProfile || k.Kind == feedObservationPerpPremium {
 			continue
 		}
 		keys = append(keys, k)

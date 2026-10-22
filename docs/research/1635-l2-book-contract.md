@@ -71,7 +71,7 @@ The capacity bounds are joint. A need set whose estimated seal, envelope or memo
 
 ## Transport
 
-- Seal version 7 carries `l2_books` sections. Market payload version 3 carries `l2_books` keyed by payload id, or `l2_books_refused` when not even refusal metadata fits. Exact payload-header agreement is required with every peer, so a payload-2 peer is refused even for an older seal form.
+- Seal version 7 carries `l2_books` sections; a seal that also carries `perp_premiums` (#1639) is seal version 8. Market payload version 4 (3 before #1639) carries `l2_books` keyed by payload id, or `l2_books_refused` when not even refusal metadata fits, and the same version carries the optional `perp_premiums` section. Exact payload-header agreement is required with every peer, so a payload-3 peer is refused even for an older seal form.
 - A section that does not fit the remaining envelope budget is sent as bounded refusal metadata (`book_capacity_refused`) and the candle frames stay usable.
 - Sealed bytes never change after sealing. Observations and markers are those known by the seal deadline.
 - Describe advertises the source, contract, semantics, bounds, window, capacity and depth for each key; a consumer refuses a peer whose advertised or actual seal coverage is short in any dimension.
