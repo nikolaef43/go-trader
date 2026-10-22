@@ -356,6 +356,8 @@ def walk_forward_optimize(
     regime_gate_on_failure: str = "open",
     regime_label_plan: Optional[dict] = None,
 ) -> dict:
+    from book_inputs import refuse_book_input_strategy
+    refuse_book_input_strategy(strategy_name, "walk-forward optimization")
     total_len = len(df)
     window_size = total_len // n_splits
     if window_size < 50:
@@ -897,6 +899,14 @@ DEFAULT_PARAM_RANGES = {
         "profile_bins": [32, 64, 128],
         "value_area_fraction": [0.6, 0.7, 0.8],
         "session_bounds": [False],
+    },
+    "order_book_imbalance": {
+        "depth_levels": [1, 5, 10, 20],
+        "entry_threshold": [0.20, 0.30, 0.40],
+        "confirmation_observations": [2, 3, 5],
+        "max_spread_bps": [2.0, 5.0, 10.0],
+        "min_combined_depth_usd": [10000.0, 100000.0, 1000000.0],
+        "max_snapshot_age_ms": [1000, 2000, 5000],
     },
     "bitcoin_lead_lag": {
         "lag_bars": [1, 2],
