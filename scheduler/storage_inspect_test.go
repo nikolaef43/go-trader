@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -120,11 +121,60 @@ func TestInspectStorageOwnership(t *testing.T) {
 		}
 	})
 
-	t.Run("an orphan holding positions is reported with its count", func(t *testing.T) {
+	t.Run("regular and option rows are counted per stored id and physical file", func(t *testing.T) {
+		cfg := splitTestConfig(t)
+		cfg.Strategies[0].StorageStrategyID = "shared-book"
+		cfg.Strategies[1].StorageStrategyID = "shared-book"
+		store := openSplitStore(t, cfg)
+		state := splitTestState(t)
+		state.Strategies["hl-live"].OptionPositions = map[string]*OptionPosition{
+			"ETH-call": {ID: "ETH-call", Underlying: "ETH", OptionType: "call", Strike: 3000, Expiry: "2026-12-18", Action: "buy", Quantity: 1},
+			"ETH-put":  {ID: "ETH-put", Underlying: "ETH", OptionType: "put", Strike: 2000, Expiry: "2026-12-18", Action: "buy", Quantity: 1},
+		}
+		state.Strategies["hl-paper"].Positions["BTC"] = &Position{Symbol: "BTC", Side: "long", Quantity: 1, AvgCost: 60000}
+		state.Strategies["hl-paper"].OptionPositions = map[string]*OptionPosition{
+			"BTC-call": {ID: "BTC-call", Underlying: "BTC", OptionType: "call", Strike: 70000, Expiry: "2026-12-18", Action: "buy", Quantity: 1},
+			"BTC-put":  {ID: "BTC-put", Underlying: "BTC", OptionType: "put", Strike: 50000, Expiry: "2026-12-18", Action: "buy", Quantity: 1},
+		}
+		if err := SaveStateWithStore(state, store); err != nil {
+			t.Fatalf("SaveStateWithStore: %v", err)
+		}
+		store.Close()
+
+		si := inspectionFor(t, cfg, false)
+		if !si.OK() {
+			t.Fatalf("rejections = %v, want none", si.Rejections)
+		}
+		wantMapped := map[storageRole]int{storageRolePrimary: 2, storageRolePaper: 3}
+		for _, fi := range si.Files {
+			if len(fi.Strategies) != 1 || fi.Strategies[0].PositionCount != wantMapped[fi.Role] {
+				t.Errorf("%s mapped books = %+v, want one book with %d positions", fi.Role, fi.Strategies, wantMapped[fi.Role])
+			}
+		}
+		report := formatStorageInspection(si)
+		for _, want := range []string{"shared-book -> hl-live (2 position(s))", "shared-book -> hl-paper (3 position(s))"} {
+			if !strings.Contains(report, want) {
+				t.Errorf("inspection report lacks %q:\n%s", want, report)
+			}
+		}
+		blob, err := json.Marshal(si)
+		if err != nil {
+			t.Fatalf("marshal inspection: %v", err)
+		}
+		if !strings.Contains(string(blob), `"position_count":2`) || !strings.Contains(string(blob), `"position_count":3`) {
+			t.Errorf("inspection JSON lacks the mapped totals: %s", blob)
+		}
+	})
+
+	t.Run("an orphan holding regular and option positions is reported not rejected", func(t *testing.T) {
 		cfg := splitTestConfig(t)
 		store := openSplitStore(t, cfg)
 		state := splitTestState(t)
 		state.Strategies["hl-paper"].Positions["BTC"] = &Position{Symbol: "BTC", Side: "long", Quantity: 1, AvgCost: 60000}
+		state.Strategies["hl-paper"].OptionPositions = map[string]*OptionPosition{
+			"BTC-call": {ID: "BTC-call", Underlying: "BTC", OptionType: "call", Strike: 70000, Expiry: "2026-12-18", Action: "buy", Quantity: 1},
+			"BTC-put":  {ID: "BTC-put", Underlying: "BTC", OptionType: "put", Strike: 50000, Expiry: "2026-12-18", Action: "buy", Quantity: 1},
+		}
 		if err := SaveStateWithStore(state, store); err != nil {
 			t.Fatalf("SaveStateWithStore: %v", err)
 		}
@@ -138,16 +188,27 @@ func TestInspectStorageOwnership(t *testing.T) {
 		var found bool
 		for _, fi := range si.Files {
 			for _, orphan := range fi.Orphans {
-				if orphan.StorageID == "hl-paper" {
+				if fi.Role == storageRolePaper && orphan.StorageID == "hl-paper" {
 					found = true
-					if orphan.PositionCount != 1 {
-						t.Errorf("orphan position count = %d, want 1", orphan.PositionCount)
+					if orphan.PositionCount != 3 {
+						t.Errorf("orphan position count = %d, want 3", orphan.PositionCount)
 					}
 				}
 			}
 		}
 		if !found {
-			t.Fatalf("orphan hl-paper not reported; files = %+v", si.Files)
+			t.Fatalf("paper orphan hl-paper not reported; files = %+v", si.Files)
+		}
+		store2 := openSplitStore(t, trimmed)
+		reloaded, orphans, err := LoadStateWithStore(trimmed, store2)
+		if err != nil {
+			t.Fatalf("LoadStateWithStore: %v", err)
+		}
+		if _, adopted := reloaded.Strategies["hl-paper"]; adopted {
+			t.Fatal("an orphan book was keyed into the roster")
+		}
+		if len(orphans) != 1 || orphans[0].Role != storageRolePaper || orphans[0].StorageID != "hl-paper" || orphans[0].PositionCount != 3 {
+			t.Errorf("orphans = %+v, want only the paper hl-paper book with 3 positions", orphans)
 		}
 	})
 
@@ -181,6 +242,30 @@ func TestInspectStorageOwnership(t *testing.T) {
 		}
 		if len(si.Files[0].Strategies) != 1 || si.Files[0].Strategies[0].ProcessID != "hl-live" {
 			t.Errorf("strategies = %+v, want hl-live mapped", si.Files[0].Strategies)
+		}
+	})
+
+	t.Run("an unreadable option positions table returns an error", func(t *testing.T) {
+		dir := t.TempDir()
+		livePath := filepath.Join(dir, "invalid.db")
+		raw, err := sql.Open("sqlite", livePath)
+		if err != nil {
+			t.Fatalf("open raw: %v", err)
+		}
+		if _, err := raw.Exec(`
+			CREATE TABLE strategies (id TEXT PRIMARY KEY, type TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL DEFAULT '');
+			CREATE TABLE option_positions (wrong_column TEXT);
+			INSERT INTO strategies (id) VALUES ('hl-live');
+		`); err != nil {
+			t.Fatalf("seed invalid schema: %v", err)
+		}
+		raw.Close()
+
+		cfg := &Config{DBFile: livePath, Strategies: []StrategyConfig{
+			{ID: "hl-live", Type: "perps", Platform: "hyperliquid", Args: []string{"--mode=live"}},
+		}}
+		if _, err := inspectStorageLayoutForConfig(cfg, false); err == nil || !strings.Contains(err.Error(), "count option positions") {
+			t.Fatalf("inspection error = %v, want the option-position read failure", err)
 		}
 	})
 
