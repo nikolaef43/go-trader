@@ -191,6 +191,9 @@ func (bc *basketCoordinator) pairVenueFor(sc StrategyConfig) (pairVenue, error) 
 	if !ok {
 		return nil, fmt.Errorf("strategy %s has no pair venue seam", sc.ID)
 	}
+	if vv, isVirtual := pv.(*pairVirtualVenue); isVirtual && !vv.isAttached() {
+		return nil, fmt.Errorf("strategy %s virtual venue is not attached to its state store; no virtual order or query runs", sc.ID)
+	}
 	rt := bc.byMember[sc.ID]
 	if rt == nil || !rt.isPair() {
 		return nil, fmt.Errorf("strategy %s has no pair runtime, so its transport identity cannot be checked", sc.ID)
@@ -263,6 +266,15 @@ func (bc *basketCoordinator) pairStartupErrors(rt *basketRuntime) []string {
 	for _, q := range rt.Expected {
 		if q != 0 {
 			expected = true
+		}
+	}
+	for _, m := range rt.Contract.pairMembersSorted() {
+		if sc, ok := bc.members[m.MemberID]; ok {
+			if v, err := bc.venueFor(sc); err == nil {
+				if vv, virtual := v.(*pairVirtualVenue); virtual && !vv.isAttached() {
+					errs = append(errs, fmt.Sprintf("pair %s member %s virtual venue is not attached to its state store; attach it after the runtime load and before startup", id, m.MemberID))
+				}
+			}
 		}
 	}
 	pending := len(rt.pairUnresolvedActions()) > 0
@@ -407,6 +419,7 @@ func (bc *basketCoordinator) stepPair(rt *basketRuntime, in basketCycleInputs) {
 	electiveBlocked := bc.reconcilePairActions(rt, in, inputs)
 	in = bc.refreshPairInputs(rt, in)
 	bc.detectPairExceptions(rt, in)
+	bc.checkPairVirtualConservation(rt)
 	bc.stepPairFunding(rt, in)
 	bc.pairLifecycleChecks(rt, in)
 	if !in.SaveBlocked {
@@ -499,6 +512,7 @@ func (bc *basketCoordinator) reconcilePairAction(rt *basketRuntime, a *basketAct
 	queried := *a
 	var out basketVenueOutcome
 	var qerr error
+	bc.notePairVirtualInventory(rt, v, a.StrategyID)
 	bc.unlocked(func() { out, qerr = v.Query(&queried) })
 	cur := rt.Actions[snap.ActionID]
 	if cur != ptr || cur.Status != snap.Status || cur.ConfirmedQty != snap.ConfirmedQty || cur.FeeEvidenceVersion != snap.FeeEvidenceVersion || cur.AppliedQty != snap.AppliedQty ||
@@ -509,6 +523,10 @@ func (bc *basketCoordinator) reconcilePairAction(rt *basketRuntime, a *basketAct
 	in = bc.refreshPairInputs(rt, in)
 	if qerr != nil {
 		bc.pairLogf(rt, "action %s (client %s) is still unresolved: the venue query failed: %v; the saved identity is kept and new risk holds", a.ActionID, a.ClientOrderID, qerr)
+		return false
+	}
+	if why := pairVirtualOutcomeFuture(v, out, in.Now.UnixMilli()); why != "" {
+		bc.holdPairAction(rt, a, "malformed or inconsistent venue evidence: "+why, true, in.Now)
 		return false
 	}
 	return bc.applyPairOutcome(rt, a, out, in, inputs)
@@ -1491,6 +1509,9 @@ func (bc *basketCoordinator) pairIncreaseHold(rt *basketRuntime, in basketCycleI
 	if pm := rt.Pair.Progress.PositionMatch; pm != nil && pm.Status == pairPositionMismatch {
 		return "the venue position does not match the pair records: " + pm.Reason
 	}
+	if why := bc.pairVirtualConservation(rt); why != "" {
+		return "virtual inventory conservation: " + why
+	}
 	if ms, _, err := bc.pairLiveMembers(rt); err != nil {
 		return err.Error()
 	} else if len(ms) > 0 {
@@ -2401,6 +2422,7 @@ func (bc *basketCoordinator) runPairAction(rt *basketRuntime, origin *basketReba
 	var out basketVenueOutcome
 	var serr error
 	skipped := ""
+	bc.notePairVirtualInventory(rt, v, c.MemberID)
 	if releaseSymbol != nil {
 		releaseSymbol()
 		releaseSymbol = nil
@@ -2425,6 +2447,10 @@ func (bc *basketCoordinator) runPairAction(rt *basketRuntime, origin *basketReba
 	}
 	if serr != nil {
 		out = basketVenueOutcome{Outcome: basketVenueUnknown, Detail: "transport failure: " + serr.Error()}
+	}
+	if why := pairVirtualOutcomeFuture(v, out, in.Now.UnixMilli()); why != "" {
+		bc.holdPairAction(rt, a, "malformed or inconsistent venue evidence: "+why, true, in.Now)
+		return false
 	}
 	inputs := bc.pairValuationsLocked(rt)
 	return bc.applyPairOutcome(rt, a, out, in, inputs)
