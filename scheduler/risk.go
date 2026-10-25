@@ -1296,7 +1296,7 @@ func forceCloseKillSwitchPositions(s *StrategyState, sc StrategyConfig, prices m
 	}
 	applyHyperliquidKillSwitchCloseFill(s, sc, hlFills, hlLiveAll, hlVirtualQty)
 	applyHyperliquidKillSwitchHedgeFill(s, sc, hlFills)
-	forceCloseAllPositions(s, &sc, prices, logger)
+	forceCloseAllPositionsFor(s, &sc, prices, pairNativeTriggerKillSwitch, logger)
 }
 
 const (
@@ -1359,8 +1359,12 @@ func classifyPositionTradeType(s *StrategyState, pos *Position) string {
 }
 
 func forceCloseAllPositions(s *StrategyState, sc *StrategyConfig, prices map[string]float64, logger *StrategyLogger) {
+	forceCloseAllPositionsFor(s, sc, prices, pairNativeTriggerCircuit, logger)
+}
+
+func forceCloseAllPositionsFor(s *StrategyState, sc *StrategyConfig, prices map[string]float64, pairTrigger string, logger *StrategyLogger) {
 	for symbol, pos := range s.Positions {
-		closeVirtualPositionAtMark(s, sc, symbol, pos, prices, logger)
+		closeVirtualPositionAtMarkFor(s, sc, symbol, pos, prices, pairTrigger, logger)
 	}
 	now := tradingNow().UTC()
 
@@ -1405,28 +1409,45 @@ func forceCloseAllPositions(s *StrategyState, sc *StrategyConfig, prices map[str
 }
 
 func closeVirtualPositionAtMark(s *StrategyState, sc *StrategyConfig, symbol string, pos *Position, prices map[string]float64, logger *StrategyLogger) {
+	closeVirtualPositionAtMarkFor(s, sc, symbol, pos, prices, pairNativeTriggerCircuit, logger)
+}
+
+func closeVirtualPositionAtMarkFor(s *StrategyState, sc *StrategyConfig, symbol string, pos *Position, prices map[string]float64, pairTrigger string, logger *StrategyLogger) {
 	if err := withVirtualCloseCostScope(s, sc, func() {
 		mutatePaperPerpsBook(s, symbol, func() {
-			closeVirtualPositionAtMarkInner(s, sc, symbol, pos, prices, logger)
+			closeVirtualPositionPairAware(s, sc, symbol, pos, prices, "circuit_breaker", pairTrigger, false, logger)
 		})
 	}); err != nil {
 		logStrategyCostRefusal(logger, "circuit-breaker close", symbol, err)
 	}
 }
 
-func closeVirtualPositionAtMarkInner(s *StrategyState, sc *StrategyConfig, symbol string, pos *Position, prices map[string]float64, logger *StrategyLogger) {
-	closeVirtualPositionInner(s, sc, symbol, pos, prices, "circuit_breaker", false, logger)
+func closeVirtualPositionInner(s *StrategyState, sc *StrategyConfig, symbol string, pos *Position, prices map[string]float64, reason string, verifiedFlat bool, logger *StrategyLogger) {
+	closeVirtualPositionPairAware(s, sc, symbol, pos, prices, reason, reason, verifiedFlat, logger)
 }
 
-func closeVirtualPositionInner(s *StrategyState, sc *StrategyConfig, symbol string, pos *Position, prices map[string]float64, reason string, verifiedFlat bool, logger *StrategyLogger) {
-	now := tradingNow().UTC()
+func closeVirtualPositionPairAware(s *StrategyState, sc *StrategyConfig, symbol string, pos *Position, prices map[string]float64, reason, pairTrigger string, verifiedFlat bool, logger *StrategyLogger) {
+	if pairStrategyMember(s, sc) {
+		requestPairEmergencyClose(s, symbol, pos.Quantity, pairTrigger)
+		if logger != nil {
+			logger.Warn("Pair emergency close requested for %s %s (%s): a pair member books only at its own checked mark or confirmed native fill, never at a shared or average-cost price", pos.Side, symbol, pairTrigger)
+		}
+		return
+	}
 	price, ok := prices[symbol]
 	if !ok {
 		price = pos.AvgCost
 	}
+	bookVirtualClose(s, sc, symbol, pos, price, reason, "", verifiedFlat, logger)
+}
+
+func bookVirtualClose(s *StrategyState, sc *StrategyConfig, symbol string, pos *Position, price float64, reason, details string, verifiedFlat bool, logger *StrategyLogger) {
+	now := tradingNow().UTC()
+	if s != nil && !s.bookClock.IsZero() {
+		now = s.bookClock
+	}
 	var pnl, value float64
 	tradeType := classifyPositionTradeType(s, pos)
-	details := ""
 	if closePositionIsCorrupt(pos) {
 		reason = reason + "_corrupt"
 		details = fmt.Sprintf("Circuit breaker close %s (corrupt qty=%.6f avg_cost=%.4f) — zero PnL booked", pos.Side, pos.Quantity, pos.AvgCost)
@@ -1513,7 +1534,7 @@ func forceCloseSettledPositions(s *StrategyState, sc StrategyConfig, prices map[
 	}
 	sort.Strings(syms)
 	for _, sym := range syms {
-		closeVirtualPositionAtMark(s, &sc, sym, s.Positions[sym], prices, logger)
+		closeVirtualPositionAtMarkFor(s, &sc, sym, s.Positions[sym], prices, pairNativeTriggerKillSwitch, logger)
 	}
 }
 
@@ -1615,6 +1636,13 @@ func checkPairMemberRisk(sc *StrategyConfig, s *StrategyState, pm *pairMarks, lo
 		r.CircuitBreakerUntil = tradingNow().UTC().Add(sc.CircuitBreakerDrawdownCooldown())
 		why := fmt.Sprintf("%s: %s, longer than %s; the circuit breaker trips (fail closed) and books no close without a checked price",
 			RiskReasonPairValuationStale, pairOverdueDetail(map[string]int64{s.ID: since}, status), formatWarningDuration(untrustedEquityLatchDeferral))
+		setHyperliquidCircuitBreakerPending(sc, s, assist)
+		setOKXCircuitBreakerPending(sc, s, assist)
+		for _, sym := range sortedPositionSymbols(s.Positions) {
+			if pos := s.Positions[sym]; pos != nil && pos.Quantity > 0 {
+				requestPairEmergencyClose(s, sym, pos.Quantity, "circuit_breaker")
+			}
+		}
 		if logger != nil {
 			logger.Warn("Circuit breaker: %s", why)
 		}
@@ -1789,8 +1817,10 @@ func forceClosePaperScopePositions(state *AppState, cfg *Config, part RiskPartit
 			continue
 		}
 		scCopy := sc
-		forceCloseAllPositions(s, &scCopy, prices, nil)
-		closed = append(closed, sc.ID)
+		forceCloseAllPositionsFor(s, &scCopy, prices, pairNativeTriggerKillSwitch, nil)
+		if !pairStrategyMember(s, &scCopy) {
+			closed = append(closed, sc.ID)
+		}
 	}
 	sort.Strings(closed)
 	return closed
@@ -1835,6 +1865,18 @@ type paperKillSwitchOutcome struct {
 	CloseApplied bool
 	AutoReset    bool
 	Message      string
+	PairPending  []string
+}
+
+const paperKillSwitchPairCommittedLine = "Pair member books closed only at each member's own checked mark, and every pair close is committed."
+
+func formatPaperKillSwitchPairPendingMessage(part RiskPartition, reason string, closed, pending []string) string {
+	detail := "No other open paper books to close."
+	if len(closed) > 0 {
+		detail = fmt.Sprintf("Paper books force-closed at mark: %s", strings.Join(closed, ", "))
+	}
+	return fmt.Sprintf("%s\n%s\n%s Pair member accounting is not committed yet: %s. The latch stays and no auto-reset runs until each pair member books at its own checked mark or confirmed fill. No exchange order was sent. Live strategies are unaffected.",
+		paperKillSwitchHeader(part), reason, detail, strings.Join(pending, "; "))
 }
 
 // applyPaperKillSwitchCycle runs once per paper partition, on that partition's
@@ -1845,14 +1887,33 @@ func applyPaperKillSwitchCycle(state *AppState, cfg *Config, prices map[string]f
 		return out
 	}
 	prs := state.partitionRisk(paperSR.Partition)
+	hasPair := pairPartitionHasPair(state, cfg, paperSR.Partition)
 	if !prs.KillSwitchCloseApplied {
 		out.Closed = forceClosePaperScopePositions(state, cfg, paperSR.Partition, prices)
+		if hasPair {
+			out.PairPending = pairEmergencyPendingFor(state, paperSR.Partition)
+		}
+		if len(out.PairPending) > 0 {
+			if len(out.Closed) > 0 {
+				out.Message = formatPaperKillSwitchPairPendingMessage(paperSR.Partition, paperSR.Reason, out.Closed, out.PairPending)
+			}
+			return out
+		}
 		prs.KillSwitchCloseApplied = true
 		out.CloseApplied = true
 		out.Message = formatPaperKillSwitchMessage(paperSR.Partition, paperSR.Reason, out.Closed)
+		if hasPair {
+			out.Message += " " + paperKillSwitchPairCommittedLine
+		}
 	}
 	if hasOwner || !prs.KillSwitchActive {
 		return out
+	}
+	if hasPair {
+		if pending := pairEmergencyPendingFor(state, paperSR.Partition); len(pending) > 0 {
+			out.PairPending = pending
+			return out
+		}
 	}
 	out.AutoReset = AutoResetConfirmedFlatKillSwitch(prs, paperSR.TotalPV, paperSR.PeakRebaselineAvailable,
 		"paper books closed at mark after portfolio kill-switch; no DM owner configured, paper latch auto-cleared")
